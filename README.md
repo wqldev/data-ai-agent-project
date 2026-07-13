@@ -2,6 +2,8 @@
 
 基于 **OpenAI Agents SDK** 的数据分析 Web 产品：Planner → Builder → Verifier 三智能体流水线。前端与后端同仓，可一键部署到 [Render](https://dashboard.render.com/)。
 
+仓库：https://github.com/wqldev/data-ai-agent-project
+
 ## 功能
 
 - 商务风格单页：配置 API、输入问题、查看过程与报告
@@ -19,16 +21,16 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 打开 http://127.0.0.1:8000
 
-## 一键部署到 Render
+## 部署到 Render
 
-1. 将本仓库推送到 GitHub
-2. 打开 [Render Dashboard](https://dashboard.render.com/) → **New** → **Blueprint**
-3. 选择该仓库，识别 `render.yaml` 后创建服务
-4. 或手动 **New Web Service**：
-   - Runtime: Python
-   - Build: `pip install -r requirements.txt`
-   - Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-   - Health Check Path: `/api/health`
+在 [Render Dashboard](https://dashboard.render.com/) → **New** → **Web Service**，连接本仓库：
+
+- Runtime: Python
+- Build: `pip install -r requirements.txt`
+- Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Health Check Path: `/api/health`
+
+也可使用 **Blueprint** 自动识别仓库中的 `render.yaml`。
 
 部署完成后，在页面右上角配置你的 API 地址、Key、模型即可使用。
 
