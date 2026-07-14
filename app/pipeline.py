@@ -19,6 +19,7 @@ from agents import (
     function_tool,
     set_tracing_disabled,
 )
+from json_repair import repair_json
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, ValidationError
 
@@ -29,6 +30,15 @@ set_tracing_disabled(True)
 T = TypeVar("T", bound=BaseModel)
 
 REJECT_MESSAGE = "请重新描述您的需求，只支持数据分析类问题。"
+
+JSON_OUTPUT_RULES = (
+    "输出必须是严格合法的 JSON 对象。\n"
+    "- 不要输出 JSON 以外的任何文字\n"
+    "- 字符串内的双引号必须转义为 \\\"\n"
+    "- 换行写成 \\n，禁止在字符串值中直接换行\n"
+    "- 不要尾随逗号\n"
+    "- 字段值尽量简短，列表每项一句话\n"
+)
 
 
 class QuestionGate(BaseModel):
@@ -59,7 +69,10 @@ class AnalysisReport(BaseModel):
     findings: list[str]
     evidence: list[str]
     recommendations: list[str]
-    raw_markdown: str = Field(description="完整 Markdown 报告正文")
+    raw_markdown: str = Field(
+        default="",
+        description="可选；完整 Markdown。可留空，由服务端根据字段组装",
+    )
 
 
 class CriterionCheck(BaseModel):
@@ -75,7 +88,8 @@ class VerificationResult(BaseModel):
     checks: list[CriterionCheck]
     summary: str
     final_report_markdown: str = Field(
-        description="最终报告 Markdown，文首明确标注验证通过与否"
+        default="",
+        description="可选；最终报告 Markdown。可留空，由服务端组装",
     )
 
 
@@ -105,8 +119,11 @@ def _make_model(cfg: LLMConfig) -> OpenAIChatCompletionsModel:
     return OpenAIChatCompletionsModel(model=cfg.model, openai_client=_make_client(cfg))
 
 
-def _schema_hint(model: type[BaseModel]) -> str:
-    return json.dumps(model.model_json_schema(), ensure_ascii=False, indent=2)
+def _compact_schema(model: type[BaseModel]) -> str:
+    """Short field list instead of full JSON Schema (reduces prompt noise)."""
+    props = model.model_json_schema().get("properties", {})
+    lines = [f"- {name}: {meta.get('description') or meta.get('type', 'any')}" for name, meta in props.items()]
+    return "\n".join(lines)
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -118,29 +135,76 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     if fence:
         raw = fence.group(1).strip()
 
-    try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            return data
-    except json.JSONDecodeError:
-        pass
-
+    candidates = [raw]
     start = raw.find("{")
     end = raw.rfind("}")
     if start >= 0 and end > start:
-        data = json.loads(raw[start : end + 1])
-        if isinstance(data, dict):
-            return data
+        candidates.append(raw[start : end + 1])
 
-    raise ValueError(f"无法从模型输出解析 JSON：{text[:300]}")
+    errors: list[str] = []
+    for candidate in candidates:
+        for attempt in (candidate, repair_json(candidate)):
+            try:
+                data = attempt if isinstance(attempt, dict) else json.loads(attempt)
+                if isinstance(data, dict):
+                    return data
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                errors.append(str(exc))
+
+    raise ValueError(
+        "无法从模型输出解析 JSON"
+        + (f"（{errors[-1]}）" if errors else "")
+        + f"：{text[:400]}"
+    )
 
 
-def _parse_output(text: str, model: type[T]) -> T:
-    data = _extract_json_object(text)
+def _parse_output(text: str, model: type[T], stage: str = "") -> T:
     try:
+        data = _extract_json_object(text)
         return model.model_validate(data)
-    except ValidationError as exc:
-        raise ValueError(f"结构化解析失败：{exc}") from exc
+    except (ValidationError, ValueError) as exc:
+        prefix = f"[{stage}] " if stage else ""
+        raise ValueError(f"{prefix}结构化解析失败：{exc}") from exc
+
+
+def _assemble_report_markdown(report: AnalysisReport) -> str:
+    if report.raw_markdown.strip():
+        return report.raw_markdown.strip()
+    lines = [
+        f"# {report.title}",
+        "",
+        "## 摘要",
+        report.executive_summary,
+        "",
+        "## 关键发现",
+        *[f"- {item}" for item in report.findings],
+        "",
+        "## 数据证据",
+        *[f"- {item}" for item in report.evidence],
+        "",
+        "## 建议",
+        *[f"- {item}" for item in report.recommendations],
+    ]
+    return "\n".join(lines)
+
+
+def _assemble_final_markdown(
+    verification: VerificationResult, report: AnalysisReport
+) -> str:
+    if verification.final_report_markdown.strip():
+        return verification.final_report_markdown.strip()
+    status = "验证结果：通过" if verification.passed else "验证结果：未通过"
+    checks = "\n".join(
+        f"- {'✓' if c.passed else '✗'} {c.id} {c.description} — {c.comment}"
+        for c in verification.checks
+    )
+    body = _assemble_report_markdown(report)
+    return (
+        f"**{status}**（{verification.score:.0f} 分）\n\n"
+        f"{verification.summary}\n\n"
+        f"### 验收明细\n{checks}\n\n"
+        f"---\n\n{body}"
+    )
 
 
 @function_tool
@@ -159,8 +223,9 @@ def _gate(cfg: LLMConfig) -> Agent:
             "非数据分析类包括：闲聊、写作、翻译、编程、百科、天气、笑话、"
             "与业务数据无关的通用问答等。\n"
             "边界情况：若只是含糊提到数据但无分析意图，判为 false。\n"
-            "只输出一个 JSON 对象，不要解释文字。\n"
-            f"JSON Schema：\n{_schema_hint(QuestionGate)}"
+            f"{JSON_OUTPUT_RULES}"
+            "字段：\n"
+            f"{_compact_schema(QuestionGate)}"
         ),
         model=_make_model(cfg),
     )
@@ -174,11 +239,11 @@ def _planner(cfg: LLMConfig) -> Agent:
             "任务：把用户的分析问题拆解为可执行子任务，明确分析类型，"
             "并定义 3-5 条可客观验证的接受标准（Acceptance Criteria）。\n"
             "要求：\n"
-            "1. 接受标准必须可检验（例如：包含趋势结论、给出关键证据数字、"
-            "覆盖品类或区域对比、给出可行动建议等）。\n"
+            "1. 接受标准必须可检验。\n"
             "2. 只做规划，不要编造具体销售数字。\n"
-            "3. 只输出一个 JSON 对象，不要 Markdown，不要解释文字。\n"
-            f"JSON Schema：\n{_schema_hint(AnalysisPlan)}"
+            f"{JSON_OUTPUT_RULES}"
+            "字段：\n"
+            f"{_compact_schema(AnalysisPlan)}"
         ),
         model=_make_model(cfg),
     )
@@ -189,14 +254,15 @@ def _builder(cfg: LLMConfig) -> Agent:
         name="BuilderAgent",
         instructions=(
             "你是数据分析执行专家（Builder）。\n"
-            "你必须先调用工具 fetch_sales_data 获取销售数据，再撰写分析报告。\n"
+            "你必须先调用工具 fetch_sales_data 获取销售数据，再输出结构化结论。\n"
             "要求：\n"
             "1. 严格依据工具返回的数据，不得捏造数据中不存在的数字。\n"
             "2. 覆盖 Planner 给出的子任务与数据需求。\n"
-            "3. 报告包含：结论摘要、关键发现、数据证据、建议。\n"
-            "4. raw_markdown 使用清晰的中文 Markdown。\n"
-            "5. 最终只输出一个 JSON 对象，不要 Markdown 包裹以外的解释文字。\n"
-            f"JSON Schema：\n{_schema_hint(AnalysisReport)}"
+            "3. findings / evidence / recommendations 各给 3-5 条短句。\n"
+            "4. raw_markdown 请留空字符串 \"\"，由系统组装正文。\n"
+            f"{JSON_OUTPUT_RULES}"
+            "字段：\n"
+            f"{_compact_schema(AnalysisReport)}"
         ),
         model=_make_model(cfg),
         tools=[fetch_sales_data],
@@ -212,12 +278,10 @@ def _verifier(cfg: LLMConfig) -> Agent:
             "规则：\n"
             "1. 全部标准通过则 passed=true，否则 passed=false。\n"
             "2. score 按通过比例折算到 0-100。\n"
-            "3. final_report_markdown 必须在文首用醒目标注：\n"
-            "   - 若通过：`验证结果：通过`\n"
-            "   - 若未通过：`验证结果：未通过`\n"
-            "   随后附验证摘要与完整报告。\n"
-            "4. 只输出一个 JSON 对象，不要额外解释文字。\n"
-            f"JSON Schema：\n{_schema_hint(VerificationResult)}"
+            "3. final_report_markdown 请留空字符串 \"\"，由系统组装。\n"
+            f"{JSON_OUTPUT_RULES}"
+            "字段：\n"
+            f"{_compact_schema(VerificationResult)}"
         ),
         model=_make_model(cfg),
     )
@@ -265,7 +329,7 @@ async def run_analysis_stream(
         _gate(cfg),
         f"用户输入：{question}",
     )
-    gate = _parse_output(_as_text(gate_result.final_output), QuestionGate)
+    gate = _parse_output(_as_text(gate_result.final_output), QuestionGate, "gate")
 
     if not gate.is_data_analysis:
         yield {
@@ -301,7 +365,7 @@ async def run_analysis_stream(
         _planner(cfg),
         f"用户分析问题：{question}",
     )
-    plan = _parse_output(_as_text(plan_result.final_output), AnalysisPlan)
+    plan = _parse_output(_as_text(plan_result.final_output), AnalysisPlan, "planner")
     yield {
         "type": "stage",
         "stage": "planner",
@@ -319,11 +383,13 @@ async def run_analysis_stream(
 
     builder_input = (
         f"用户问题：{question}\n\n"
-        f"分析计划（JSON）：\n{plan.model_dump_json(indent=2)}\n\n"
-        "请调用 fetch_sales_data 获取数据，然后只输出符合 schema 的 JSON 报告。"
+        f"分析计划（JSON）：\n{plan.model_dump_json()}\n\n"
+        "请调用 fetch_sales_data 获取数据，然后只输出符合字段要求的 JSON。"
+        "raw_markdown 填空字符串。"
     )
     report_result = await Runner.run(_builder(cfg), builder_input)
-    report = _parse_output(_as_text(report_result.final_output), AnalysisReport)
+    report = _parse_output(_as_text(report_result.final_output), AnalysisReport, "builder")
+    report = report.model_copy(update={"raw_markdown": _assemble_report_markdown(report)})
     yield {
         "type": "stage",
         "stage": "builder",
@@ -339,15 +405,26 @@ async def run_analysis_stream(
         "message": "Verifier 正在对照接受标准验证报告…",
     }
 
+    # Keep verifier input compact — omit long markdown to reduce bad JSON risk.
+    compact_report = {
+        "title": report.title,
+        "executive_summary": report.executive_summary,
+        "findings": report.findings,
+        "evidence": report.evidence,
+        "recommendations": report.recommendations,
+    }
     verify_input = (
         f"用户问题：{question}\n\n"
-        f"接受标准（JSON）：\n"
-        f"{json.dumps([c.model_dump() for c in plan.acceptance_criteria], ensure_ascii=False, indent=2)}\n\n"
-        f"待验证报告（JSON）：\n{report.model_dump_json(indent=2)}\n\n"
-        "请只输出符合 schema 的 JSON 验证结果。"
+        f"接受标准：\n{json.dumps([c.model_dump() for c in plan.acceptance_criteria], ensure_ascii=False)}\n\n"
+        f"待验证报告：\n{json.dumps(compact_report, ensure_ascii=False)}\n\n"
+        "请只输出 JSON。final_report_markdown 填空字符串。"
     )
     verify_result = await Runner.run(_verifier(cfg), verify_input)
-    verification = _parse_output(_as_text(verify_result.final_output), VerificationResult)
+    verification = _parse_output(
+        _as_text(verify_result.final_output), VerificationResult, "verifier"
+    )
+    final_md = _assemble_final_markdown(verification, report)
+    verification = verification.model_copy(update={"final_report_markdown": final_md})
     yield {
         "type": "stage",
         "stage": "verifier",
@@ -363,7 +440,7 @@ async def run_analysis_stream(
         "plan": plan.model_dump(),
         "report": report.model_dump(),
         "verification": verification.model_dump(),
-        "final_markdown": verification.final_report_markdown,
+        "final_markdown": final_md,
     }
 
 

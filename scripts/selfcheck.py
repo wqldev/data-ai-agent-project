@@ -91,6 +91,23 @@ def test_json_extract() -> None:
     print("[ok] json_extract")
 
 
+def test_json_repair() -> None:
+    broken = (
+        '{\n'
+        '  "title": "测试",\n'
+        '  "executive_summary": "整体上行",\n'
+        '  "findings": ["发现1",],\n'
+        '  "evidence": ["证据1"],\n'
+        '  "recommendations": ["建议1"],\n'
+        '  "raw_markdown": ""\n'
+        '}'
+    )
+    report = _parse_output(broken, AnalysisReport)
+    assert report.title == "测试"
+    assert report.findings == ["发现1"]
+    print("[ok] json_repair")
+
+
 if __name__ == "__main__":
     test_sales_data()
     test_normalize_url()
@@ -98,4 +115,5 @@ if __name__ == "__main__":
     test_static_files()
     test_llm_config()
     test_json_extract()
+    test_json_repair()
     print("\nAll offline checks passed.")
