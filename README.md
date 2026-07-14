@@ -2,8 +2,6 @@
 
 基于 **OpenAI Agents SDK** 的数据分析 Web 产品：Planner → Builder → Verifier 三智能体流水线。前端与后端同仓，可一键部署到 [Render](https://dashboard.render.com/)。
 
-仓库：https://github.com/wqldev/data-ai-agent-project
-
 ## 功能
 
 - 商务风格单页：配置 API、输入问题、查看过程与报告
